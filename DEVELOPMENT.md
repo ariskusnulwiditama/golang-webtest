@@ -49,7 +49,7 @@ Verified on 2026-11-22 (executed, not assumed):
 | `podman compose` | **working** — `podman-compose` 1.6.0 provider (`pip install podman-compose`) |
 | Dev database | **running** — container `wts-db` (`postgres:16-alpine`, PostgreSQL **16.16**), healthy on `127.0.0.1:5432` |
 | Docker Desktop | not installed; Podman is the container runtime |
-| Workspace `d:\code\goproject2` | Go module scaffolded (`cmd/`, `internal/`, `migrations/`, `.editorconfig`, `.gitattributes`); `web/`, `worker/` pending; git repository initialised on `main` with the Phase 1 tree staged |
+| Workspace `d:\code\goproject2` | Go module scaffolded (`cmd/`, `internal/`, `migrations/`, `.editorconfig`, `.gitattributes`); `web/`, `worker/` pending; git repository on `main`, Phase 1 committed (`8f75cbf`, 30 files) |
 
 Implication: the whole stack (Go + Node + containers) can be built and verified locally.
 Verified end-to-end on 2026-11-22, not assumed: `podman compose up -d db` → container reports
