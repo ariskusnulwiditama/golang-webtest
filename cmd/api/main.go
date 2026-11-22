@@ -18,12 +18,14 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/ariskusnulwiditama/golang-webtest/internal/features/auth"
 	"github.com/ariskusnulwiditama/golang-webtest/internal/platform/apperr"
 	"github.com/ariskusnulwiditama/golang-webtest/internal/platform/config"
 	"github.com/ariskusnulwiditama/golang-webtest/internal/platform/database"
 	"github.com/ariskusnulwiditama/golang-webtest/internal/platform/health"
 	"github.com/ariskusnulwiditama/golang-webtest/internal/platform/httpx"
 	"github.com/ariskusnulwiditama/golang-webtest/internal/platform/logger"
+	"github.com/ariskusnulwiditama/golang-webtest/internal/platform/ratelimit"
 )
 
 // version is injected at build time:
@@ -36,6 +38,13 @@ const (
 	readinessTimeout  = 2 * time.Second
 	readHeaderTimeout = 10 * time.Second
 	maxHeaderBytes    = 1 << 20 // 1 MiB
+
+	// Credential endpoints are rate limited per client IP (in-process bucket;
+	// see internal/platform/ratelimit for the single-replica caveat).
+	loginPerMinute    = 10
+	loginBurst        = 10
+	registerPerMinute = 5
+	registerBurst     = 5
 )
 
 func main() {
@@ -142,6 +151,20 @@ func buildRouter(cfg config.Config, log *slog.Logger, db *database.DB) *gin.Engi
 	health.New(log, version, readinessTimeout, map[string]health.Checker{
 		"database": db,
 	}).Register(router)
+
+	// Phase 2 accounts: repository → service → handler, mounted under /api/v1.
+	authService := auth.NewService(
+		auth.NewRepository(db.Gorm),
+		auth.NewHasher(),
+		auth.NewTokenizer(cfg.Auth),
+		log,
+	)
+	auth.NewHandler(log, authService).RegisterRoutes(
+		router.Group("/api/v1"),
+		auth.RequireAuth(log, authService),
+		ratelimit.New(loginPerMinute, loginBurst).Middleware(log, ratelimit.ByIP),
+		ratelimit.New(registerPerMinute, registerBurst).Middleware(log, ratelimit.ByIP),
+	)
 
 	router.NoRoute(func(c *gin.Context) {
 		httpx.Fail(c, log, apperr.NotFound("route"))

@@ -233,24 +233,37 @@ Conventions: `2xx` envelope `{data, meta?}`; `4xx/5xx` envelope `{error{code,mes
 (duplicate name, reorder mismatch), `422` domain rule violation, `429` rate limited,
 `500` internal, `503` dependency unavailable.
 
+Phase 2 auth contract (implemented 2026-11-22):
+
+- `POST /auth/register` → `201 {user, token, token_type:"Bearer", expires_at}` — registers and logs
+  in one round trip; email is trimmed and lower-cased, password ≥ 10 characters (≤ 72 bytes) and is
+  never returned; `409 conflict` when the address is taken.
+- `POST /auth/login` → `200` with the same session shape; unknown email, wrong password and disabled
+  account all return the identical `401 invalid email or password`.
+- `GET /auth/me`, `PATCH /auth/me` → `{user}`; `PATCH` accepts `name`, or
+  `current_password` + `new_password` together (both are checked); field problems come back as `422`
+  with a `details` entry per field.
+- `429 rate_limited` + `Retry-After` from an in-process per-IP bucket: 10 requests/min for login,
+  5/min for register.
+
 ## 9. Recorder architecture (kept out of the execution engine)
 
 The recorder shares only the *browser factory* and *selector heuristics* with the executor;
 sessions, event capture, and the relay live in `worker/src/recorder` + `internal/recorder`.
 
-**Tier 1 (target): interactive streamed recording.** Worker launches Chromium (headful under
-Xvfb inside the container runtime — Podman locally, Docker-compatible image), attaches a recorder
+**Tier 1 (spike after the core features, AD-16): interactive streamed recording.** Worker launches
+Chromium (headful under Xvfb inside the container runtime — Podman locally, Docker-compatible image),
+attaches a recorder
 instrumentation script (`page.addInitScript`) that listens
 in the capture phase without `preventDefault`, so normal site behaviour is untouched. Frames go
 out via CDP `Page.startScreencast` (JPEG, ~10 fps, quality 60) → Go WS relay → `<canvas>` in the
 SPA. User input from the SPA is mapped back to viewport coordinates and dispatched with
 `Input.dispatchMouseEvent` / `insertText` / `dispatchKeyEvent`.
 
-**Tier 2 (fallback, decided at Phase 5 spike): assisted picker.** If streamed interactivity proves
-unreliable (latency, IME, coordinate scaling), the recorder degrades to: worker opens the URL,
+**Tier 2 (v1 deliverable per AD-16): assisted picker.** The worker opens the URL,
 user picks from a rendered element tree / clicks a screenshot region, worker performs the action
-server-side, and the interaction is recorded. Same step format and same save path — only the
-input channel differs.
+server-side, and the interaction is recorded. Same step format and same save path — only the input
+channel differs, so upgrading to Tier 1 later does not change stored data.
 
 **Event capture:** navigation (`framenavigated`), click (capture-phase listener, ignore
 `preventDefault`ed scrolls), input/change (debounced 300 ms → one `fill`), select, checkbox/radio,
@@ -268,11 +281,15 @@ edit/delete/reorder, "Save as test case" (choose suite + name), "Discard".
 
 ## 10. Security model
 
-- **Passwords:** bcrypt cost 12, min length 8 + strength check, never logged, never returned.
-- **JWT:** HS256, secret from `JWT_SECRET` (startup fails if < 32 chars), claims
-  `sub, role, iat, exp, iss, jti`, TTL `JWT_TTL` (default 24 h). 401 handled client-side by
-  clearing the session and redirecting to `/login`. Logout is client-side (stateless) —
-  documented as a known limitation (no server-side revocation list in v1).
+- **Passwords:** bcrypt cost 12, 10–72 characters (bcrypt silently truncates beyond 72 bytes, so the
+  service rejects longer input), never logged, never returned. An unknown email still pays a dummy
+  bcrypt comparison so response time cannot be used to enumerate accounts.
+- **JWT:** HS256 with the algorithm pinned during verification (blocks `alg: none` and algorithm
+  confusion), secret from `JWT_SECRET` (startup fails if < 32 chars), claims
+  `sub, role, email, iat, nbf, exp, iss`, TTL `JWT_TTL` (default 24 h). Every verification failure
+  returns the same `401 invalid or expired token`; the cause is attached for the log only. 401 is
+  handled client-side by clearing the session and redirecting to `/login`. Logout is client-side
+  (stateless) — documented as a known limitation (no server-side revocation list in v1, AD-14).
 - **Authorization:** every query is scoped by `owner_id` in the service layer; a missing or
   foreign resource returns **404**, never 403, to avoid ID enumeration.
 - **Worker channel:** `/internal/v1/*` requires `X-Worker-Token` (constant-time compare) and is
@@ -326,7 +343,7 @@ progress row flipped. No phase starts before the previous phase's exit criteria 
 |---|---|---|---|
 | **0 Planning** ✅ | this document set | approval received | S |
 | **1 Foundation** ✅ | repo scaffold, `cmd/api`, `cmd/migrate`, config, slog logger, GORM/pgx pool, `000001_init` migrations (all 12 tables), `/healthz` + `/readyz`, `apperr` + error middleware, request-id, graceful shutdown, `.env.example`, `.gitignore`, compose skeleton | **met 2026-11-22**: `go build`/`go vet`/`go test ./...` clean; `migrate up` → `down 1` → `up` verified on PostgreSQL 16; live `/healthz`, `/readyz`, 404/405 envelopes and DSN redaction verified (evidence in `DEVELOPMENT.md`) | M |
-| **2 Auth** | bcrypt, register/login/me/patch, JWT issue+verify, auth middleware, role claim, login rate limit, unit tests | health + auth flows exercised with `curl`; service tests pass; no secret in logs | S |
+| **2 Auth** ✅ | bcrypt cost 12, register/login, `GET`/`PATCH /auth/me`, HS256 JWT issue+verify with role claim, `RequireAuth` middleware, per-IP login/register rate limits, table-driven tests | **met 2026-11-22**: `go build`/`go vet`/`go test ./...` clean (7 packages, 2 new); 18/18 live `curl` checks against `wts-db` — register 201 with normalised email and no password material, `/me` 200/401 with correlating request ids, password change invalidates the old password, unknown email and wrong password return identical 401s, duplicate register 409, validation 422 with per-field details, 8 of 14 rapid logins → 429 + `Retry-After`; token failure causes are logged only via `WithCause` (evidence in `DEVELOPMENT.md`) | S |
 | **3 Domain CRUD** | projects, environments, suites, test cases, steps (create/list/get/update/delete/duplicate/reorder), pagination/filter/sort, ownership scoping, Swagger annotations, repo+service tests | every endpoint returns the documented envelope; reorder is transactional and idempotent; Swagger UI renders; tests pass | L |
 | **4 Execution engine** | `workerclient` adapter, `execution_jobs` queue + dispatcher + reaper, `/internal/v1` endpoints, WS hub + tickets, worker runner (browser factory, 14 actions, timeouts, cancellation, cleanup), screenshots pipeline, `POST/GET /executions` | worker executes a real 10-step scenario on Chromium against a fixture site; `/executions/:id` + WS show live progress; cancel stops within 10 s; no lingering browser after failure; integration tests pass | L |
 | **5 Recorder** | recorder session API + worker recorder module, selector ladder, event capture/serialization, live frame relay, save-as-test-case, tests for capture + serialization | record a login flow end-to-end, edit/reorder steps, save, then execute the saved case successfully | L |
@@ -347,16 +364,16 @@ against real APIs instead of placeholders; the layout/UI kit can be brought forw
 6. `DEVELOPMENT.md` and, if contracts changed, `docs/*.md` updated in the same change.
 7. No secret, credential or absolute local path committed.
 
-## 14. Open questions (remaining; non-blocking)
+## 14. Open questions — all decided 2026-11-22
 
-1. **Recorder tier** — approve Tier 1 streamed interactive recording with Tier 2 fallback, or
-   commit to Tier 2 only for v1?
-2. **Auth depth** — access token only (24 h, client-side logout) as implemented by default, or
-   refresh tokens + server-side revocation in v1?
-3. **Project sharing** — owner-only (as designed) or add `project_members` now?
+| Question | Decision | ADR |
+|---|---|---|
+| Recorder tier | **Tier 2 assisted picker first**; Tier 1 screencast is a time-boxed spike after the core features | AD-16 |
+| Auth depth | **Access token only** (HS256, 24 h, client-side logout); refresh tokens are an additive later step | AD-14 |
+| Project sharing | **Owner-only**; `project_members` deferred, the authorizer is the single swap point | AD-15 |
+| Go module path | `github.com/ariskusnulwiditama/golang-webtest` | — |
 
-Resolved:
-- ~~Go module path~~ — `github.com/ariskusnulwiditama/golang-webtest`.
+Resolved earlier:
 - ~~Toolchain install~~ — Node 22.23.5 and Podman 6.2.0 are installed; no Docker Desktop needed.
 - ~~Container runtime / compose provider~~ — `podman-compose` 1.6.0 installed; `podman compose` works.
 - ~~Database engine~~ — PostgreSQL 16 confirmed. SQLite was evaluated and rejected (single writer

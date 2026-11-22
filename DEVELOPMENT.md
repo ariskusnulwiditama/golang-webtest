@@ -4,7 +4,7 @@ Living progress log. Update this file at the end of every work session (rule 20)
 
 ## Current status
 
-**Phase 1 (backend foundation) complete and verified against the dev database.**
+**Phases 1 and 2 (backend foundation + auth) complete and verified against the dev database.**
 Phase 0 documents are unchanged; application code now exists — Go 1.25, module
 `github.com/ariskusnulwiditama/golang-webtest`:
 
@@ -23,6 +23,12 @@ Phase 0 documents are unchanged; application code now exists — Go 1.25, module
 - `internal/platform/database` — GORM handle + pgx pool (limits, ping at startup, redacted
   DSN in logs) and the migrator used by `cmd/migrate` / `DB_AUTO_MIGRATE`.
 - `internal/platform/health` — liveness (never touches dependencies) and readiness (pings DB).
+- `internal/features/auth` — user repository over `users` (citext email), bcrypt cost 12,
+  register/login, `GET`/`PATCH /auth/me`, HS256 access tokens with the role claim and
+  `RequireAuth` middleware. The middleware re-reads the account, so a deleted or deactivated user
+  cannot keep using an unexpired token.
+- `internal/platform/ratelimit` — per-IP token bucket in front of login (10/min) and register
+  (5/min); in-process, which matches the single-replica assumption (AD-14, AD-15, AD-16 resolved).
 
 Verified on 2026-11-22 (executed, not assumed):
 
@@ -36,6 +42,16 @@ Verified on 2026-11-22 (executed, not assumed):
 - `bin/api.exe` against `wts-db`: `/healthz` 200 `{"data":{"status":"ok","version":"dev"}}`,
   `/readyz` 200 with `checks.database=ok`, unknown route → 404 envelope whose `request_id`
   matches the `X-Request-ID` header; startup log prints the DSN with `xxxxx` for the password.
+- Phase 2 rehearsal on 2026-11-22 — 18/18 checks against `wts-db` with a real `bin/api.exe`:
+  register 201 (`role=user`, email normalised to lower case, no `password` string anywhere in the
+  body, 308-character bearer token with `expires_at` +24 h); `GET /auth/me` 200 with the same id;
+  `GET /auth/me` without a token → 401 `unauthorized` whose `request_id` matches `X-Request-ID`;
+  `PATCH /auth/me` name 200; `PATCH` password 200 then the old password → 401 and the new one → 200;
+  wrong password and unknown email both 401 with the identical message; duplicate register 409
+  `conflict`; invalid payload 422 with `details` for all three fields; 14 rapid logins → 8×429
+  `rate_limited` with `Retry-After`; a garbage token → 401; `/healthz` still 200.
+- `go test ./...` = 7 packages ok: `auth` (service/repository rules, token attacks, handler flows),
+  `ratelimit` (burst, refill, Retry-After, sweep, 429 envelope), plus the Phase 1 packages.
 
 ## Verified environment (checked, not assumed)
 
@@ -82,6 +98,9 @@ Remaining operational notes:
 | AD-11 | **PostgreSQL 16** stays (SQLite rejected) | SQLite has a single writer (no `SKIP LOCKED`), no `jsonb`/`citext`/`text[]`, no deferrable unique constraint, and every future `ALTER TABLE` becomes a table rebuild. Postgres is now as cheap to run as SQLite (verified container) and all approved docs stay valid |
 | AD-12 | Podman + `podman-compose` is the container runtime | Already installed and verified; cross-platform and rootless. `compose.yaml` avoids provider-specific features so `docker compose` also works |
 | AD-13 | Gin + GORM (pgx) + golang-migrate with `embed.FS` | Gin supplies routing/binding/validation; GORM keeps repositories terse over pgx; embedding migrations makes `cmd/api` and `cmd/migrate` self-contained binaries that need no source tree at runtime |
+| AD-14 | **Access-token only** — HS256 JWT, 24 h TTL, no refresh tokens, client-side logout | Least moving parts for v1: no refresh table, no rotation/reuse-detection logic, no cookie or CSRF surface — exactly the documented v1 limitation. The upgrade is purely additive (`000002_refresh_tokens` + `POST /auth/refresh` + rotation on reuse) and the `Tokenizer` seam already isolates signing from handlers |
+| AD-15 | **Projects are owner-only** — no `project_members` table in v1 | A single `owner_id` predicate in one authorizer is easier to audit and test than a membership join, and keeps Phase 3 at its planned size. Sharing later is additive: nullable member table plus one policy function behind the existing authorizer |
+| AD-16 | **Recorder ships Tier 2 (assisted picker) first**; Tier 1 screencast becomes a time-boxed spike after core features (refines AD-9's ordering, not its intent) | The 2 GiB Podman VM cannot host multi-browser execution plus CDP screencast comfortably, and R2 is the highest-risk item. Tier 2 still produces real selectors from a real browser, so Phase 5 delivers value without the riskiest subsystem |
 
 ## Module tracker
 
@@ -91,7 +110,7 @@ Remaining operational notes:
 | Repo scaffold + tooling | Done — Go module `github.com/ariskusnulwiditama/golang-webtest`, `.editorconfig`, `cmd/`, `internal/`, `migrations/`; `web/` and `worker/` land in their phases |
 | Dev database (compose + verification) | Done — `wts-db` healthy, host↔DB TCP path proven with pgx v5 |
 | Backend foundation (config, logger, db, migrations, health, errors, DI, shutdown) | Done — `cmd/api`, `cmd/migrate`, `000001_init` applied and rolled back, unit tests green |
-| Auth (register, login, JWT, middleware, profile) | Next |
+| Auth (register, login, JWT, middleware, profile) | Done — `internal/features/auth` + `internal/platform/ratelimit`; 18/18 live checks; access-token only (AD-14) |
 | Projects + environments CRUD | Not started |
 | Suites CRUD | Not started |
 | Test cases + steps (duplicate, reorder) | Not started |
@@ -148,6 +167,13 @@ go run ./cmd/api                                # serves on 127.0.0.1:8080
 # in another shell
 Invoke-RestMethod http://127.0.0.1:8080/healthz   # liveness + version, no dependencies
 Invoke-RestMethod http://127.0.0.1:8080/readyz    # pings the database, 503 when it is down
+
+# auth round trip — register logs in, then reuse the token (contract: docs/ARCHITECTURE.md §8)
+$session = Invoke-RestMethod -Method Post http://127.0.0.1:8080/api/v1/auth/register `
+  -ContentType 'application/json' `
+  -Body '{"email":"qa@example.com","password":"long-enough-pass","name":"QA Bot"}'
+Invoke-RestMethod http://127.0.0.1:8080/api/v1/auth/me `
+  -Headers @{ Authorization = "Bearer $($session.data.token)" }
 ```
 
 `DB_AUTO_MIGRATE=true` (the `.env.example` default) applies pending migrations during API startup;
@@ -165,23 +191,28 @@ Success responses are `{"data": ...}` with `meta` added for list endpoints. `X-R
 on every response and appears in every log line, so a user-reported id maps to a server log entry;
 the same id is generated when the client sends an invalid one.
 
-## Open questions for Phase 2+
+## Decisions taken 2026-11-22
 
-1. **Auth scope** — the foundation assumes access-token-only (24 h JWT, client-side logout). Add
-   refresh tokens + server-side revocation now, or defer until the UI needs "remember me"?
-2. **Project access** — owner-only (as designed), or shared projects via `project_members` in v1?
-3. **Recorder tier** — approve Tier 1 (interactive streamed recording) with Tier 2 fallback, or
-   start with Tier 2 only to reduce risk?
+All three open questions were answered; the rationale lives in the ADR table (AD-14 … AD-16):
 
-Resolved: module path `github.com/ariskusnulwiditama/golang-webtest`; database engine
+1. **Auth scope — access-token only.** HS256, 24 h, client-side logout, no refresh table.
+   Refresh tokens + revocation are an additive later step (`000002_refresh_tokens`, `POST
+   /auth/refresh`) if session length becomes a real complaint.
+2. **Project access — owner-only.** `project_members` is deferred; Phase 3 keeps every query
+   behind one authorizer so the swap is a single function.
+3. **Recorder — Tier 2 first.** The assisted picker is the v1 deliverable; the Tier 1 screencast
+   becomes a time-boxed spike once the core features are done.
+
+Also resolved earlier: module path `github.com/ariskusnulwiditama/golang-webtest`; database engine
 PostgreSQL 16 (AD-11); `podman compose` provider; toolchain versions.
 
 ## Next tasks
 
-1. Phase 2 — auth: `internal/features/auth` (user repository, bcrypt cost 12, register/login,
-   JWT issuance/verification, auth middleware, `GET/PATCH /api/v1/me`) with table-driven tests.
-2. Phase 3 — projects + environments CRUD with owner scoping, pagination caps and the shared
-   envelope; then suites, test cases and step reorder (`DEFERRABLE` unique already in place).
-3. Keep the module tracker current and ship tests with every module, recording the actual
+1. Phase 3 — projects + environments CRUD with owner scoping (AD-15), pagination caps and the
+   shared envelope; then suites, test cases and step reorder (`DEFERRABLE` unique already in place).
+2. Consider wiring Swagger UI early (`_test`-guarded `swag init` import) once the first CRUD module
+   exists — cheap demo value before the frontend lands.
+3. Create the GitHub remote and push `main` when a repository name/visibility is chosen.
+4. Keep the module tracker current and ship tests with every module, recording the actual
    `go test ./...` output here.
 
