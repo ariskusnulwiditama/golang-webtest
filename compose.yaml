@@ -1,0 +1,31 @@
+# WebTest Studio — development stack (Podman / Docker Compose compatible)
+#
+# Verified with: podman 6.2.0 + podman-compose 1.6.0 on Windows/WSL.
+# Only the database is defined so far; api / worker / web are added in later phases.
+# Secrets come from .env (git-ignored) — copy .env.example to .env first.
+services:
+  db:
+    image: docker.io/library/postgres:16-alpine
+    container_name: wts-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-webtest}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-webtest}
+      # Deterministic collation for reproducible ordering in tests
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # Bound to loopback only: the database must never be reachable from the LAN.
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-webtest} -d ${POSTGRES_DB:-webtest}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  db-data:
+    name: wts-db-data
